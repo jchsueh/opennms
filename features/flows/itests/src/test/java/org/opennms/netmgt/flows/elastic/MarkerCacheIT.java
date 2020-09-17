@@ -35,12 +35,15 @@ import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.hasProperty;
-import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
+import static org.junit.Assert.assertEquals;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import org.junit.Assert;
 import org.junit.Before;
@@ -55,6 +58,7 @@ import org.opennms.features.jest.client.index.IndexStrategy;
 import org.opennms.features.jest.client.template.IndexSettings;
 import org.opennms.netmgt.dao.DatabasePopulator;
 import org.opennms.netmgt.dao.api.InterfaceToNodeCache;
+import org.opennms.netmgt.dao.api.IpInterfaceDao;
 import org.opennms.netmgt.dao.api.MonitoringLocationDao;
 import org.opennms.netmgt.dao.api.NodeDao;
 import org.opennms.netmgt.dao.api.SessionUtils;
@@ -65,10 +69,14 @@ import org.opennms.netmgt.flows.classification.ClassificationEngine;
 import org.opennms.netmgt.flows.classification.FilterService;
 import org.opennms.netmgt.flows.classification.internal.DefaultClassificationEngine;
 import org.opennms.netmgt.flows.classification.persistence.api.RuleBuilder;
+import org.opennms.netmgt.model.OnmsIpInterface;
 import org.opennms.netmgt.model.OnmsSnmpInterface;
 import org.opennms.test.JUnitConfigurationEnvironment;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.test.context.ContextConfiguration;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionCallbackWithoutResult;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import com.codahale.metrics.MetricRegistry;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
@@ -107,7 +115,13 @@ public class MarkerCacheIT {
     private SnmpInterfaceDao snmpInterfaceDao;
 
     @Autowired
+    private IpInterfaceDao ipInterfaceDao;
+
+    @Autowired
     private InterfaceToNodeCache interfaceToNodeCache;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
 
     @Rule
     public WireMockRule wireMockRule = new WireMockRule(WireMockConfiguration.options().dynamicPort());
@@ -222,11 +236,11 @@ public class MarkerCacheIT {
 
             elasticFlowRepository.persist(Lists.newArrayList(getMockFlow(Flow.Direction.EGRESS)), getMockFlowSource());
 
-            Assert.assertEquals(0,snmpInterfaceDao.findAllHavingIngressFlows(2).size());
-            Assert.assertEquals(0, snmpInterfaceDao.findAllHavingEgressFlows(2).size());
+            assertEquals(0, snmpInterfaceDao.findAllHavingIngressFlows(2).size());
+            assertEquals(0, snmpInterfaceDao.findAllHavingEgressFlows(2).size());
 
             // the following call resulted to two wrong entries before, since the wrong query returned entries from other nodes with egress flows
-            Assert.assertEquals(0, snmpInterfaceDao.findAllHavingFlows(2).size());
+            assertEquals(0, snmpInterfaceDao.findAllHavingFlows(2).size());
         }
     }
 
@@ -266,17 +280,37 @@ public class MarkerCacheIT {
             Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(1), is(empty()));
             Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(2), is(empty()));
 
-            // node1 -> node2
-            // egress: node1 should have flows
             elasticFlowRepository.persist(Lists.newArrayList(getMockFlow(Flow.Direction.EGRESS)), getMockFlowSource());
-            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(1), hasSize(1));
-            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(2), is(empty()));
+            checkInterfaces(1, "192.168.1.1");
+            checkInterfaces(2);
 
-            // node1 -> node2
-            // ingress: node2 should have flows
             elasticFlowRepository.persist(Lists.newArrayList(getMockFlow(Flow.Direction.INGRESS)), getMockFlowSource());
-            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(1), hasSize(1));
-            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(2), hasSize(1));
+            checkInterfaces(1, "192.168.1.1", "192.168.1.1");
+            checkInterfaces(2);
+
+            elasticFlowRepository.persist(Lists.newArrayList(getMockFlow(Flow.Direction.INGRESS)), getMockFlowSource());
+            checkInterfaces(1, "192.168.1.1", "192.168.1.1");
+            checkInterfaces(2);
         }
+    }
+
+    private void checkInterfaces(final Integer nodeId, final String... expectedInterfaces) {
+        doInTransaction(() -> {
+            List<String> interfaces = snmpInterfaceDao.findAllHavingFlows(nodeId).stream()
+                    .map(OnmsSnmpInterface::getPrimaryIpInterface)
+                    .map(OnmsIpInterface::getIpAddressAsString)
+                    .sorted()
+                    .collect(Collectors.toList());
+            assertEquals(Arrays.stream(expectedInterfaces).sorted().collect(Collectors.toList()), interfaces);
+        });
+    }
+
+    private void doInTransaction(final Runnable r) {
+        this.transactionTemplate.execute(new TransactionCallbackWithoutResult() {
+            @Override
+            public void doInTransactionWithoutResult(final TransactionStatus status) {
+                r.run();
+            }
+        });
     }
 }
