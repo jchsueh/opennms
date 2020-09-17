@@ -35,6 +35,7 @@ import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.hasProperty;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -226,6 +227,56 @@ public class MarkerCacheIT {
 
             // the following call resulted to two wrong entries before, since the wrong query returned entries from other nodes with egress flows
             Assert.assertEquals(0, snmpInterfaceDao.findAllHavingFlows(2).size());
+        }
+    }
+
+    @Test
+    public void shouldDistinguishBetweenIngressAndEgressWhenDeterminingIfFlowsAreAvailable() throws Exception {
+        Assert.assertFalse(OnmsSnmpInterface.INGRESS_AND_EGRESS_REQUIRED);
+
+        stubFor(post("/_bulk")
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")));
+
+        final ClassificationEngine classificationEngine = new DefaultClassificationEngine(() -> Lists.newArrayList(
+                new RuleBuilder().withName("http").withDstPort("80").withProtocol("tcp,udp").build(),
+                new RuleBuilder().withName("https").withDstPort("443").withProtocol("tcp,udp").build()
+        ), FilterService.NOOP);
+
+        final DocumentEnricher documentEnricher = new DocumentEnricher(
+                new MetricRegistry(), nodeDao, interfaceToNodeCache, sessionUtils, classificationEngine,
+                new CacheConfigBuilder()
+                        .withName("flows.node")
+                        .withMaximumSize(1000)
+                        .withExpireAfterWrite(300)
+                        .build());
+
+        final JestClientFactory factory = new JestClientFactory();
+        factory.setHttpClientConfig(new HttpClientConfig.Builder("http://localhost:" + wireMockRule.port()).build());
+
+        try (JestClient client = factory.getObject()) {
+            final ElasticFlowRepository elasticFlowRepository = new ElasticFlowRepository(new MetricRegistry(),
+                    client, IndexStrategy.MONTHLY, documentEnricher,
+                    sessionUtils, nodeDao, snmpInterfaceDao,
+                    new MockIdentity(), new MockTracerRegistry(), new MockDocumentForwarder(), new IndexSettings(),
+                    mock(SmartQueryService.class));
+
+            Assert.assertThat(nodeDao.findAllHavingFlows(), is(empty()));
+            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(1), is(empty()));
+            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(2), is(empty()));
+
+            // node1 -> node2
+            // egress: node1 should have flows
+            elasticFlowRepository.persist(Lists.newArrayList(getMockFlow(Flow.Direction.EGRESS)), getMockFlowSource());
+            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(1), hasSize(1));
+            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(2), is(empty()));
+
+            // node1 -> node2
+            // ingress: node2 should have flows
+            elasticFlowRepository.persist(Lists.newArrayList(getMockFlow(Flow.Direction.INGRESS)), getMockFlowSource());
+            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(1), hasSize(1));
+            Assert.assertThat(snmpInterfaceDao.findAllHavingFlows(2), hasSize(1));
         }
     }
 }
